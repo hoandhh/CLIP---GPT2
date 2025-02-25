@@ -1,6 +1,7 @@
 """
     Module contains final Model and all pieces of it.
 """
+
 import torch
 import torch.nn as nn
 from transformers import CLIPModel, CLIPProcessor, GPT2LMHeadModel, GPT2Tokenizer
@@ -23,42 +24,45 @@ class ImageEncoder(nn.Module):
         # only one image at a time
         image = self.preprocessor(images=image, return_tensors="pt").to(self.device)
         image_features = self.model(**image)
-        
+
         print(image_features.pooler_output.shape)
 
         return image_features.pooler_output
 
-# class ImageEncoder(nn.Module):
-#     """
-#     Encodes both image and text, then concatenates their embeddings.
-#     """
 
-#     def __init__(self, model, device="cpu"):
-#         super(ImageEncoder, self).__init__()
+class ImageTextEncoder(nn.Module):
+    """
+    Encodes both image and text, then concatenates their embeddings.
+    """
 
-#         self.device = device
+    def __init__(self, model, device="cpu"):
+        super(ImageTextEncoder, self).__init__()
 
-#         # Load processor and CLIP model
-#         self.processor = CLIPProcessor.from_pretrained(model)
-#         self.model = CLIPModel.from_pretrained(model).to(self.device)
+        self.device = device
 
-#     def forward(self, image, text):
-#         """
-#         Encode image and text, then concatenate their embeddings.
-#         """
-#         # Tách riêng input cho ảnh và văn bản
-#         image_inputs = self.processor(images=image, return_tensors="pt").to(self.device)
-#         text_inputs = self.processor(text=text, return_tensors="pt").to(self.device)
+        # Load processor and CLIP model
+        self.processor = CLIPProcessor.from_pretrained(model)
+        self.model = CLIPModel.from_pretrained(model).to(self.device)
 
-#         # Trích xuất embedding
-#         image_features = self.model.vision_model(**image_inputs).pooler_output  # (batch_size, img_dim)
-#         text_features = self.model.text_model(**text_inputs).pooler_output      # (batch_size, text_dim)
+    def forward(self, image, text):
+        """
+        Encode image and text, then concatenate their embeddings.
+        """
+        image_inputs = self.processor(images=image, return_tensors="pt").to(self.device)
+        text_inputs = self.processor(text=text, return_tensors="pt").to(self.device)
 
-#         # Nối 2 vector
-#         combined_features = torch.cat((image_features, text_features), dim=-1)  # (batch_size, img_dim + text_dim)
+        image_features = self.model.vision_model(
+            **image_inputs
+        ).pooler_output  # (batch_size, img_dim)
+        text_features = self.model.text_model(
+            **text_inputs
+        ).pooler_output  # (batch_size, text_dim)
 
-#         return combined_features
+        combined_features = torch.cat(
+            (image_features, text_features), dim=-1
+        )  # (batch_size, img_dim + text_dim)
 
+        return combined_features
 
 
 class Mapping(nn.Module):
@@ -165,45 +169,33 @@ class Net(nn.Module):
         max_len,
         device="cpu",
     ):
-        """
-        Model constructor.
-        Args:
-            num_layers: number of layers in the TransformerEncoder
-            n_heads: number of heads in the MultiHeadAttention
-            forward_expansion: expansion factor for the feedforward layer
-            dropout: dropout probability
-            max_len: maximum length of the generated text
-        """
         super(Net, self).__init__()
 
         self.device = device
         self.ep_len = ep_len
 
-        self.ie = ImageEncoder(model=clip_model, device=device)
+        # Thay thế ImageEncoder bằng ImageTextEncoder
+        self.ie = ImageTextEncoder(model=clip_model, device=device)
+
+        embed_size = self.ie.model.config.hidden_size * 2  # Do nối 2 vector ảnh + text
+
         self.mp = Mapping(
             ep_len=self.ep_len,
             num_layers=num_layers,
-            embed_size=self.ie.model.config.hidden_size,
-            # embed_size =  self.ie.model.text_model.hidden_size,
-            
+            embed_size=embed_size,  # Dùng embed_size mới sau khi nối
             n_heads=n_heads,
             forward_expansion=forward_expansion,
             dropout=dropout,
             device=device,
         )
+
         self.td = TextDecoder(model=text_model, device=device)
-        
-        # print("Vision model hidden size:", self.ie.model.vision_model.config.hidden_size)
-        # print("Text model hidden size:", self.ie.model.text_model.config.hidden_size)
-        # print("Projection dim:", self.ie.model.config.projection_dim)
 
         assert (
-            self.ie.model.config.hidden_size == self.td.model.config.n_embd
-        ), "Embedding size of models mismatch"
+            embed_size == self.td.model.config.n_embd
+        ), "Embedding size mismatch: Image+Text embedding must match GPT-2 embedding size"
 
         self.max_len = max_len
-
-        # self.criterion = nn.CrossEntropyLoss(ignore_index=self.td.tokenizer.pad_token_id) # chanded on epoch 91
         self.criterion = nn.CrossEntropyLoss()
 
         self.freeze_layers()
@@ -215,34 +207,20 @@ class Net(nn.Module):
         ]:  # freeze everything, except 1st and last transformer layer in Decoder
             p.requires_grad = False
 
-    def forward(self, img, temperature=1.0):
-        """
-        Caption generation for a single image.
-        Args:
-            img: image to generate caption for [PIL.Image]
-        Returns:
-            caption: generated caption [str]
-            tokens: generated tokens [torch.Tensor]
-        """
-
+    def forward(self, img, text, temperature=1.0):
         if temperature <= 0.0:
             temperature = 1.0
             print("Temperature must be positive. Setting it to 1.0")
 
         with torch.no_grad():
-            img_embedded = self.ie(img)
+            img_text_embedded = self.ie(img, text)
 
-            # (ep_len, embed_size)
-            img_mapped = self.mp(img_embedded)
+            img_mapped = self.mp(img_text_embedded)
 
             sos_emb = self.td.model.transformer.wte(
                 torch.tensor(self.td.tokenizer.bos_token_id).to(self.device)
-            )
+            ).unsqueeze(0)
 
-            # sos_emb shape embed_size -> (1, embed_size)
-            sos_emb = sos_emb.unsqueeze(0)
-
-            # (ep_len + 1, embed_size)
             start_emb = torch.cat([sos_emb, img_mapped], dim=0)
 
             tokens = []
@@ -251,12 +229,10 @@ class Net(nn.Module):
                     tok_emb = self.td.model.transformer.wte(
                         torch.tensor(tokens).to(self.device)
                     )
-
                     emb = torch.cat([start_emb, tok_emb], dim=0)
                 else:
                     emb = start_emb
 
-                # add positional enc
                 pos_emb = self.td.model.transformer.wpe(
                     torch.arange(emb.shape[0]).to(self.device)
                 )
@@ -265,36 +241,25 @@ class Net(nn.Module):
                 pred = self.td(emb)
 
                 pred = torch.softmax(pred / temperature, dim=-1)
-
                 _, pred = torch.max(pred, dim=1)
 
                 last_token = pred[-1].item()
-
                 tokens.append(last_token)
 
                 if last_token == self.td.tokenizer.eos_token_id:
                     break
 
-            decoded = self.td.tokenizer.decode(tokens[:-1])
+        decoded = self.td.tokenizer.decode(tokens[:-1])
+        return decoded.strip().capitalize(), tokens
 
-            decoded = decoded.strip()
-            decoded = decoded[0].upper() + decoded[1:]
-
-            return decoded, tokens
-
-    def train_forward(self, img_emb, trg_cap, att_mask):
-        # method should get embedded by CLIP images and trg_text without last token.
-        # dataset should contain image, embedded image, text
-
+    def train_forward(self, img_text_emb, trg_cap, att_mask):
         x, x_mask = trg_cap[:, :-1], att_mask[:, :-1]
         y = trg_cap[:, 1:]
 
-        img_mapped = self.mp(img_emb, train_mode=True)
+        img_mapped = self.mp(img_text_emb, train_mode=True)
 
-        # embed all texts and con cat with map sos
         text_emb = self.td.model.transformer.wte(x)
 
-        # N, len, embed_size
         x = torch.concat([img_mapped, text_emb], dim=1)
         x_mask = torch.concat(
             [torch.ones(x_mask.shape[0], self.ep_len).to(self.device), x_mask], dim=1
@@ -302,8 +267,7 @@ class Net(nn.Module):
 
         pos_emb = self.td.model.transformer.wpe(
             torch.arange(x.shape[1]).to(self.td.device)
-        )
-        pos_emb = pos_emb.expand_as(x)
+        ).expand_as(x)
 
         x += pos_emb
 
@@ -322,7 +286,7 @@ if __name__ == "__main__":
         ["openai/clip-vit-base-patch32", "gpt2"],
         ["openai/clip-vit-large-patch14", "gpt2-medium"],
     ]:
-        m = Net(
+        model = Net(
             clip_model=clip,
             text_model=text,
             ep_len=3,
@@ -333,26 +297,30 @@ if __name__ == "__main__":
             max_len=20,
         )
 
-        m.eval()
-        r = m(torch.randn(3, 224, 224))
-        print(r)
+        model.eval()
+        sample_image = torch.randn(3, 224, 224)  # Giả lập ảnh
+        sample_text = "A man is playing guitar"  # Giả lập văn bản mô tả
 
-        m.train()
+        output_caption, tokens = model(sample_image, sample_text)
+        print(output_caption)
+
+        model.train()
         N = 10
-        emb = m.td.model.config.n_embd
+        emb = model.td.model.config.n_embd
         length = 20
 
-        l = m.train_forward(
+        loss = model.train_forward(
             torch.rand(N, emb),
             torch.randint(1, 50000, (N, length)),
             att_mask=torch.concat(
                 [torch.ones(N, length - 3), torch.zeros(N, 3)], dim=1
             ),
         )
-        print(l)
+        print(loss)
 
-        # number of parameters
-        print(f"Total number of parameters: {sum(p.numel() for p in m.parameters())}")
         print(
-            f"Number of trainable parameters: {sum(p.numel() for p in m.parameters() if p.requires_grad)}"
+            f"Total number of parameters: {sum(p.numel() for p in model.parameters())}"
+        )
+        print(
+            f"Number of trainable parameters: {sum(p.numel() for p in model.parameters() if p.requires_grad)}"
         )
